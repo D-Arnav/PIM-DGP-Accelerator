@@ -7,6 +7,14 @@
   [3. Setup](#3-setup)  
   [4. Programming Guide](#4-programming-guide)
 
+## 0. Command for running IPR
+```
+./sim '--gtest_filter=IncrementalPageRank.IPR'
+./sim '--gtest_filter=IncrementalPageRank.IPR_PIM'
+./sim '--gtest_filter=IncrementalPageRankBenchFixture.ipr'
+./sim '--gtest_filter=IncrementalPageRank.*'
+```
+
 ## 1. Overview
 
 PIMSimulator is a cycle accurate model that Single Instruction, Multiple Data (SIMD) execution units
