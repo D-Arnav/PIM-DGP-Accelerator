@@ -1,4 +1,5 @@
 import os
+import sys
 from os.path import join as joinpath
 
 
@@ -45,13 +46,22 @@ def build(target_name, base_path, build_flags):
     # add flags
     env = getFlags(env)
 
+    cpp_path = [base_path["lib"], base_path["source"], base_path["tools"]]
+    lib_path = ['.']
+
+    if sys.platform == 'darwin':
+        # Add Homebrew googletest paths for macOS
+        gtest_prefix = '/opt/homebrew/opt/googletest'
+        cpp_path.append(os.path.join(gtest_prefix, 'include'))
+        lib_path.append(os.path.join(gtest_prefix, 'lib'))
+
     env.VariantDir(base_path["build"], base_path["source"], duplicate=0)
     env.VariantDir(base_path["tools_build"], base_path["tools"], duplicate=0)
     build_sources = getSources("build")
     env.Program(target=target_name["binary"],
                 source=build_sources,
-                CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                LIBPATH=['.'], LIBS=['gtest', 'pthread'])
+                CPPPATH=cpp_path,
+                LIBPATH=lib_path, LIBS=['gtest', 'pthread'])
 
     no_lib = ARGUMENTS.get('NO_LIBRARY', 0)
     if int(no_lib) == 0:
@@ -59,14 +69,14 @@ def build(target_name, base_path, build_flags):
         # print ("Creating a static library from objects")
         env.StaticLibrary(target=target_name["library"],
                           source=lib_sources,
-                          CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                          LIBPATH=['.'],
+                          CPPPATH=cpp_path,
+                          LIBPATH=lib_path,
                           LIBS=['gtest', 'pthread'])
         # print ("Creating a shared library from objects")
         env.SharedLibrary(target=target_name["library"],
                           source=lib_sources,
-                          CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                          LIBPATH=['.'],
+                          CPPPATH=cpp_path,
+                          LIBPATH=lib_path,
                           LIBS=['gtest', 'pthread'])
 
 
@@ -88,8 +98,8 @@ base_path = {
 
 build_flags = {
     "gprof_option": '',
-    "CXXFLAGS": '-g -O2 -std=c++14 -Wall -Wno-reorder -Wno-sign-compare',
-    "LINKFLAGS": '-g -O2 -std=c++14 -Wall -Wno-reorder -Wno-sign-compare',
+    "CXXFLAGS": '-g -O2 -std=c++17 -Wall -Wno-reorder -Wno-sign-compare',
+    "LINKFLAGS": '-g -O2 -std=c++17 -Wall -Wno-reorder -Wno-sign-compare',
 }
 
 setNumJobs()
