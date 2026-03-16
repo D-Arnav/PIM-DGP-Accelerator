@@ -88,8 +88,8 @@ base_path = {
 
 build_flags = {
     "gprof_option": '',
-    "CXXFLAGS": '-g -O2 -std=c++14 -Wall -Wno-reorder -Wno-sign-compare',
-    "LINKFLAGS": '-g -O2 -std=c++14 -Wall -Wno-reorder -Wno-sign-compare',
+    "CXXFLAGS": '-g -O2 -std=c++17 -Wall -Wno-reorder -Wno-sign-compare',
+    "LINKFLAGS": '-g -O2 -std=c++17 -Wall -Wno-reorder -Wno-sign-compare',
 }
 
 setNumJobs()
