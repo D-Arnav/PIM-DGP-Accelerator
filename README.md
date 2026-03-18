@@ -300,3 +300,125 @@ Here, the buffer must be at least 256bit size container.
 * Sanghoon Cha (s.h.cha@samsung.com)
 * Seungwoo Seo (sgwoo.seo@samsung.com)
 * Jin-seong kim (jseong82.kim@samsung.com)
+
+---
+
+## 5. PageRank on PIM (Milestone 1)
+
+This section covers the incremental PageRank implementation added for the EECS 573 final project.
+
+### 5.1 What was implemented
+
+Two versions of PageRank are implemented and compared:
+
+| | CPU Baseline | PIM Accelerated |
+|---|---|---|
+| Precision | FP32 | FP16 |
+| SpMV step | CPU (sparse, iterates edges only) | PIM GEMV kernel (dense N×N matrix) |
+| Damping step | CPU | CPU |
+| Incremental updates | Warm start from previous ranks | Warm start from previous ranks |
+
+The key idea: PageRank repeatedly computes `rank_new = (1-d)/N + d * M * rank_old`. The expensive part is `M * rank_old` (a matrix-vector multiply). The PIM version offloads this to the GEMV kernel running inside HBM2 memory.
+
+### 5.2 New files
+
+| File | Description |
+|---|---|
+| `src/tests/PageRankGraph.h` | Graph data structure, CPU PageRank, transition matrix builder for PIM |
+| `src/tests/PageRankTestCases.cpp` | 7 gtest tests covering correctness, incremental updates, and stats |
+
+### 5.3 Build
+
+Same as the rest of the simulator:
+
+```bash
+scons
+```
+
+### 5.4 Running the PageRank tests
+
+```bash
+# Run all PageRank tests
+./sim --gtest_filter="PageRankFixture*"
+
+# Run a specific test
+./sim --gtest_filter="PageRankFixture.baseline_known_graph"
+./sim --gtest_filter="PageRankFixture.stats_pim_vs_cpu"
+```
+
+> Note: The PIM tests simulate cycle-accurate HBM2 memory, so they are slow on a laptop (each test takes 5–15 seconds of wall-clock time).
+
+### 5.5 Test descriptions
+
+| Test | What it does |
+|---|---|
+| `baseline_known_graph` | Runs CPU PageRank on a small 4-node graph. Checks ranks sum to 1 and are all positive. |
+| `baseline_incremental_edges` | Starts with a ring graph, inserts 10 edges, verifies warm-start converges to the same result as cold-start. |
+| `baseline_random_graph_timing` | Runs CPU PageRank on a random 256-node graph and reports wall-clock time. |
+| `pim_spmv_matches_cpu` | Runs one SpMV step on PIM and compares the result to the CPU. Passes if all 256 outputs are within 5% (FP16 tolerance). |
+| `pim_full_pagerank` | Runs full PageRank to convergence using PIM for each SpMV step. Compares final ranks to CPU baseline. |
+| `pim_incremental_edge_insertion` | Inserts 16 edges mid-run, then compares cold vs warm restart iteration counts on PIM. |
+| `stats_pim_vs_cpu` | Runs both versions and prints a side-by-side stats table (cycles, memory transactions, data moved, bandwidth). |
+
+### 5.6 Understanding the output
+
+#### Correctness tests (tests 1–5)
+
+```
+[  PASSED  ] PageRankFixture.baseline_known_graph
+```
+A passing test means ranks are numerically correct within tolerance.
+
+#### Incremental test output
+
+```
+Initial convergence:        12 iters
+Cold restart (post-insert): 14 iters
+Warm restart (incremental):  9 iters
+```
+- **Cold restart**: recomputes from uniform ranks after edge insertion
+- **Warm restart**: recomputes starting from the previous ranks (incremental)
+- Fewer iterations for warm restart = the benefit of incremental PageRank
+
+#### Stats table output (test 7)
+
+```
+╔══════════════════════════════════════════════════════╗
+║          Stats Comparison  (N=256)                   ║
+╠══════════════════════╦═══════════════════════════════╣
+║ Metric               ║ CPU baseline  │ PIM           ║
+╠══════════════════════╬═══════════════════════════════╣
+║ Iterations           ║             8 │             8 ║
+║ FLOPs (M)            ║          0.03 │             - ║
+║ Simulated cycles     ║             - │         44154 ║
+║ Simulated time (ns)  ║             - │       44154.0 ║
+║ Memory reads (txns)  ║             - │        104960 ║
+║ Memory writes (txns) ║             - │        676480 ║
+║ Data moved (MB)      ║          0.08 │         23.85 ║
+║ Memory BW (GB/s)     ║             - │        566.34 ║
+╚══════════════════════╩═══════════════════════════════╝
+```
+
+| Field | What it means |
+|---|---|
+| **Simulated cycles** | Clock cycles in the simulated HBM2 hardware (not wall-clock time) |
+| **Simulated time (ns)** | `cycles × tCK` — how long this would take on real HBM2 hardware |
+| **Memory reads/writes (txns)** | Number of 32-byte burst transactions issued across all 64 channels |
+| **Data moved — dense (MB)** | CPU estimate assuming a full N×N dense matrix is read each iteration |
+| **Data moved — sparse (MB)** | CPU estimate using only the actual edges (what our CPU baseline actually does) |
+| **Memory BW used (GB/s)** | How much of HBM2's bandwidth the PIM run utilized (peak is ~900 GB/s) |
+
+**Key takeaway**: PIM hits 566 GB/s bandwidth (close to HBM2 peak), showing the hardware is well-utilized. However, the current PIM implementation uses a dense N×N matrix while the CPU uses sparse iteration over edges, so the CPU moves less data on sparse graphs. Switching to a sparse PIM kernel is the planned next optimization.
+
+### 5.7 Graph parameters
+
+Tests use synthetic random graphs generated internally — no external files needed. Graph parameters are hardcoded per test:
+
+| Test | N (vertices) | Avg out-degree |
+|---|---|---|
+| baseline_known_graph | 4 | hand-crafted |
+| baseline_incremental_edges | 64 | 1 (ring) + 10 random |
+| baseline_random_graph_timing | 256 | 8 |
+| pim_* and stats_* | 256 | 8 |
+
+To change graph size or density, edit the `const int N` and `avg_deg` values at the top of each test in `src/tests/PageRankTestCases.cpp`, then rebuild with `scons`.

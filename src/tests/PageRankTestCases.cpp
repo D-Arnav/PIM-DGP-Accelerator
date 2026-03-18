@@ -2,10 +2,13 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 #include "Burst.h"
 #include "FP16.h"
+#include "MemoryController.h"
+#include "MemorySystem.h"
 #include "MultiChannelMemorySystem.h"
 #include "gtest/gtest.h"
 #include "tests/KernelAddrGen.h"
@@ -27,15 +30,115 @@ class PageRankFixture : public testing::Test
     virtual void SetUp() {}
     virtual void TearDown() {}
 
+    // mem_ is kept so we can read memory stats after runPIM()
+    shared_ptr<MultiChannelMemorySystem> mem_;
+
     // Create a PIMKernel backed by the 64-channel HBM2 system.
     shared_ptr<PIMKernel> make_pim_kernel(int num_vertices)
     {
-        // Memory capacity hint: rough upper bound for N x N FP16 matrix
-        int mem_hint = num_vertices * num_vertices / 16 * 2;  // bursts * 32 bytes
-        shared_ptr<MultiChannelMemorySystem> mem = make_shared<MultiChannelMemorySystem>(
+        int mem_hint = num_vertices * num_vertices / 16 * 2;
+        mem_ = make_shared<MultiChannelMemorySystem>(
             "ini/HBM2_samsung_2M_16B_x64.ini", "system_hbm_64ch.ini", ".", "pagerank_app",
             max(mem_hint, 256 * 64 * 2));
-        return make_shared<PIMKernel>(mem, 64, 1);
+        return make_shared<PIMKernel>(mem_, 64, 1);
+    }
+
+    // Read simulated cycles + memory traffic from the PIM system.
+    // Returns: {cycles, total_reads, total_writes, data_moved_MB, sim_time_ns}
+    struct PIMStats
+    {
+        uint64_t cycles;
+        uint64_t total_reads;
+        uint64_t total_writes;
+        double   data_moved_MB;
+        double   sim_time_ns;
+    };
+
+    PIMStats getPIMStats(shared_ptr<PIMKernel> kernel)
+    {
+        PIMStats s;
+        s.cycles = kernel->getCycle();
+
+        s.total_reads = 0;
+        s.total_writes = 0;
+        int num_chans = getConfigParam(UINT, "NUM_CHANS");
+        for (int i = 0; i < num_chans; i++)
+        {
+            s.total_reads  += mem_->channels[i]->memoryController->totalReads;
+            s.total_writes += mem_->channels[i]->memoryController->totalWrites;
+        }
+
+        // Each transaction moves one burst = BL * JEDEC_DATA_BUS_BITS / 8 bytes
+        uint64_t burst_bytes = getConfigParam(UINT, "BL") *
+                               getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") / 8;
+        s.data_moved_MB = (double)(s.total_reads + s.total_writes) *
+                          burst_bytes / (1024.0 * 1024.0);
+
+        // Simulated time: cycles * tCK (nanoseconds)
+        s.sim_time_ns = s.cycles * getConfigParam(FLOAT, "tCK");
+        return s;
+    }
+
+    // Estimate CPU memory traffic for dense SpMV (N x N FP32 matrix).
+    // Each iteration: read matrix (N*N*4 B) + read rank (N*4 B) + write result (N*4 B).
+    struct CPUStats
+    {
+        int      iterations;
+        uint64_t flops;               // multiply-add ops (sparse)
+        double   est_memory_MB;       // estimated memory traffic (dense model)
+        double   sparse_memory_MB;    // estimated memory traffic (sparse, actual edges)
+    };
+
+    CPUStats getCPUStats(int N, int iterations, int num_edges)
+    {
+        CPUStats s;
+        s.iterations = iterations;
+        // Each edge = 1 multiply + 1 add
+        s.flops = (uint64_t)iterations * num_edges * 2;
+        // Dense model: read full N*N matrix + rank each iter
+        s.est_memory_MB = (double)iterations *
+                          (N * N * 4 + N * 4 + N * 4) / (1024.0 * 1024.0);
+        // Sparse model: read only edge values + rank entries accessed
+        s.sparse_memory_MB = (double)iterations *
+                             (num_edges * 4 + N * 4 + N * 4) / (1024.0 * 1024.0);
+        return s;
+    }
+
+    void printStatsTable(const PIMStats& pim, const CPUStats& cpu, int N)
+    {
+        uint64_t burst_bytes = getConfigParam(UINT, "BL") *
+                               getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") / 8;
+        double pim_bw = (pim.total_reads + pim.total_writes) * burst_bytes /
+                        (pim.sim_time_ns);  // GB/s  (bytes / ns = GB/s)
+
+        cout << "\n  ╔══════════════════════════════════════════════════════╗" << endl;
+        cout <<   "  ║          Stats Comparison  (N=" << N << ")                    ║" << endl;
+        cout <<   "  ╠══════════════════════════╦═══════════════════════════╣" << endl;
+        cout <<   "  ║ Metric                   ║ CPU baseline  │ PIM       ║" << endl;
+        cout <<   "  ╠══════════════════════════╬═══════════════════════════╣" << endl;
+        cout <<   "  ║ Iterations               ║ " << setw(13) << cpu.iterations
+             <<   "  │ " << setw(9) << cpu.iterations << " ║" << endl;
+        cout <<   "  ║ FLOPs (M)                ║ " << setw(13) << fixed << setprecision(2)
+             <<   cpu.flops / 1e6
+             <<   "  │ " << setw(9) << "-" << " ║" << endl;
+        cout <<   "  ║ Simulated cycles         ║ " << setw(13) << "-"
+             <<   "  │ " << setw(9) << pim.cycles << " ║" << endl;
+        cout <<   "  ║ Simulated time (ns)      ║ " << setw(13) << "-"
+             <<   "  │ " << setw(9) << fixed << setprecision(1) << pim.sim_time_ns << " ║" << endl;
+        cout <<   "  ║ Memory reads (txns)      ║ " << setw(13) << "-"
+             <<   "  │ " << setw(9) << pim.total_reads << " ║" << endl;
+        cout <<   "  ║ Memory writes (txns)     ║ " << setw(13) << "-"
+             <<   "  │ " << setw(9) << pim.total_writes << " ║" << endl;
+        cout <<   "  ║ Data moved - dense (MB)  ║ " << setw(13) << fixed << setprecision(2)
+             <<   cpu.est_memory_MB
+             <<   "  │ " << setw(9) << pim.data_moved_MB << " ║" << endl;
+        cout <<   "  ║ Data moved - sparse (MB) ║ " << setw(13) << cpu.sparse_memory_MB
+             <<   "  │ " << setw(9) << "-" << " ║" << endl;
+        cout <<   "  ║ Memory BW used (GB/s)    ║ " << setw(13) << "-"
+             <<   "  │ " << setw(9) << fixed << setprecision(2) << pim_bw << " ║" << endl;
+        cout <<   "  ╚══════════════════════════╩═══════════════════════════╝" << endl;
+        cout <<   "  Note: CPU uses sparse iteration (edges only)." << endl;
+        cout <<   "        PIM uses dense N×N matrix (current impl)." << endl;
     }
 };
 
@@ -459,4 +562,113 @@ TEST_F(PageRankFixture, pim_incremental_edge_insertion)
     cout << "  Cold restart (post-insert):" << iters_cold2 << " iters" << endl;
     cout << "  Warm restart (incremental):" << iters_warm  << " iters" << endl;
     cout << "  Max diff cold vs warm: " << max_diff << endl;
+}
+
+// ===========================================================================
+// Test 7: Cycle count and memory traffic — PIM vs CPU baseline
+//
+// Runs both versions on the same N=256 random graph and prints a side-by-side
+// comparison of:
+//   - Simulated PIM cycles and time
+//   - Total memory transactions (reads + writes) from all 64 channels
+//   - Total data moved (MB)
+//   - Estimated CPU memory traffic (dense and sparse models)
+// ===========================================================================
+
+TEST_F(PageRankFixture, stats_pim_vs_cpu)
+{
+    cout << "\n>> PageRank Stats: PIM vs CPU memory traffic (N=256)" << endl;
+
+    const int N = 256;
+    const float damping = 0.85f;
+    const float tol = 1e-4f;
+    const int max_iter = 100;
+    const float base = (1.0f - damping) / N;
+
+    PageRankGraph g = PageRankGraph::randomGraph(N, 8.0, 42);
+
+    // Count total edges for CPU stats
+    int total_edges = 0;
+    for (int u = 0; u < N; u++) total_edges += g.outDegree(u);
+
+    // -----------------------------------------------------------------------
+    // CPU baseline — count iterations
+    // -----------------------------------------------------------------------
+    int cpu_iters = 0;
+    {
+        vector<float> rank(N, 1.0f / N);
+        vector<float> new_rank(N);
+        for (int iter = 0; iter < max_iter; iter++)
+        {
+            cpu_iters++;
+            float dangling = 0.0f;
+            for (int u = 0; u < N; u++)
+                if (g.outDegree(u) == 0) dangling += rank[u];
+
+            fill(new_rank.begin(), new_rank.end(), base + damping * dangling / N);
+            for (int u = 0; u < N; u++)
+            {
+                if (g.outDegree(u) == 0) continue;
+                float share = damping * rank[u] / g.outDegree(u);
+                for (int v : g.outNeighbors(u)) new_rank[v] += share;
+            }
+            float diff = 0.0f;
+            for (int v = 0; v < N; v++) diff += fabs(new_rank[v] - rank[v]);
+            swap(rank, new_rank);
+            if (diff < tol) break;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PIM — run full PageRank, then read cycle + memory stats
+    // -----------------------------------------------------------------------
+    shared_ptr<PIMKernel> kernel = make_pim_kernel(N);
+
+    NumpyBurstType weight_npbst, input_npbst;
+    g.buildTransitionMatrix(weight_npbst);
+
+    vector<float> pim_rank(N, 1.0f / N);
+    int pim_iters = 0;
+
+    for (int iter = 0; iter < max_iter; iter++)
+    {
+        pim_iters++;
+        input_npbst.bData.clear();
+        input_npbst.bShape.clear();
+        input_npbst.shape.clear();
+        g.buildRankVector(pim_rank, input_npbst);
+
+        kernel->preloadGemv(&weight_npbst);
+        kernel->executeGemv(&weight_npbst, &input_npbst, false);
+
+        unsigned end_col = kernel->getResultColGemv(N / 16, N);
+        BurstType* raw = new BurstType[N];
+        kernel->readResult(raw, pimBankType::ODD_BANK, N, 0, 0, end_col);
+        kernel->runPIM();
+
+        vector<float> new_rank(N);
+        for (int v = 0; v < N; v++)
+            new_rank[v] = base + damping * convertH2F(raw[v].fp16ReduceSum());
+        delete[] raw;
+
+        float diff = 0.0f;
+        for (int v = 0; v < N; v++) diff += fabs(new_rank[v] - pim_rank[v]);
+        pim_rank = new_rank;
+        if (diff < tol) break;
+    }
+
+    // Read stats
+    PIMStats pim_s = getPIMStats(kernel);
+    CPUStats cpu_s = getCPUStats(N, cpu_iters, total_edges);
+
+    cout << "  Graph: N=" << N << "  edges=" << total_edges
+         << "  avg_deg=" << (double)total_edges / N << endl;
+    cout << "  CPU converged in " << cpu_iters << " iters" << endl;
+    cout << "  PIM converged in " << pim_iters << " iters" << endl;
+
+    printStatsTable(pim_s, cpu_s, N);
+
+    // Sanity checks
+    EXPECT_GT(pim_s.cycles, 0ULL);
+    EXPECT_GT(pim_s.total_reads, 0ULL);
 }
