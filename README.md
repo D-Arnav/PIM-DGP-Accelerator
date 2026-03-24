@@ -359,6 +359,7 @@ scons
 | `pim_full_pagerank` | Runs full PageRank to convergence using PIM for each SpMV step. Compares final ranks to CPU baseline. |
 | `pim_incremental_edge_insertion` | Inserts 16 edges mid-run, then compares cold vs warm restart iteration counts on PIM. |
 | `stats_pim_vs_cpu` | Runs both versions and prints a side-by-side stats table (cycles, memory transactions, data moved, bandwidth). |
+| `stats_cpu_dram_simulated` | Routes the CPU's sparse memory access pattern through the same HBM2 DRAM simulator (no PIM ops), giving real simulated cycle counts for both sides so the comparison is apples-to-apples. |
 
 ### 5.6 Understanding the output
 
@@ -380,7 +381,7 @@ Warm restart (incremental):  9 iters
 - **Warm restart**: recomputes starting from the previous ranks (incremental)
 - Fewer iterations for warm restart = the benefit of incremental PageRank
 
-#### Stats table output (test 7)
+#### Stats table output (test 7 — estimated CPU traffic)
 
 ```
 ╔══════════════════════════════════════════════════════╗
@@ -399,16 +400,40 @@ Warm restart (incremental):  9 iters
 ╚══════════════════════╩═══════════════════════════════╝
 ```
 
+The dashes on the CPU side exist because CPU runs on real hardware — the PIM simulator has no visibility into it. Test 8 fixes this.
+
+#### Stats table output (test 8 — both sides through DRAM simulator)
+
+Test 8 routes the CPU's sparse memory accesses through the same HBM2 DRAM simulator (without any PIM instructions), giving real simulated cycle counts on both sides.
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║     Stats Comparison (N=256, both through HBM2 DRAM sim)    ║
+╠══════════════════════════╦═══════════════╦═════════════════╣
+║ Metric                   ║ CPU (no PIM)  ║ PIM             ║
+╠══════════════════════════╬═══════════════╬═════════════════╣
+║ Iterations               ║             8 ║              10 ║
+║ Simulated cycles         ║          1392 ║           44154 ║
+║ Simulated time (ns)      ║        1392.0 ║         44154.0 ║
+║ Memory reads (txns)      ║          2536 ║          104960 ║
+║ Memory writes (txns)     ║           256 ║          676480 ║
+║ Data moved (MB)          ║          0.09 ║           23.85 ║
+║ Memory BW (GB/s)         ║         64.18 ║          566.34 ║
+╠══════════════════════════╩═══════════════╩═════════════════╣
+║ PIM cycle speedup: 0.03x                                    ║
+╚════════════════════════════════════════════════════════════╝
+```
+
 | Field | What it means |
 |---|---|
 | **Simulated cycles** | Clock cycles in the simulated HBM2 hardware (not wall-clock time) |
 | **Simulated time (ns)** | `cycles × tCK` — how long this would take on real HBM2 hardware |
 | **Memory reads/writes (txns)** | Number of 32-byte burst transactions issued across all 64 channels |
-| **Data moved — dense (MB)** | CPU estimate assuming a full N×N dense matrix is read each iteration |
-| **Data moved — sparse (MB)** | CPU estimate using only the actual edges (what our CPU baseline actually does) |
-| **Memory BW used (GB/s)** | How much of HBM2's bandwidth the PIM run utilized (peak is ~900 GB/s) |
+| **Data moved (MB)** | Total bytes moved = transactions × 32 bytes |
+| **Memory BW (GB/s)** | Effective bandwidth utilized (HBM2 peak is ~900 GB/s) |
+| **PIM cycle speedup** | `CPU simulated time / PIM simulated time` |
 
-**Key takeaway**: PIM hits 566 GB/s bandwidth (close to HBM2 peak), showing the hardware is well-utilized. However, the current PIM implementation uses a dense N×N matrix while the CPU uses sparse iteration over edges, so the CPU moves less data on sparse graphs. Switching to a sparse PIM kernel is the planned next optimization.
+**Key takeaway**: For a sparse graph (N=256, ~2000 edges), CPU is currently ~32x faster in simulated cycles because it only reads the edges it needs (~2500 transactions) while PIM loads the entire dense 256×256 matrix (~780,000 transactions). PIM does utilize 566 GB/s bandwidth (near HBM2 peak), showing the hardware works well — the bottleneck is the dense matrix representation. Switching to a sparse PIM kernel is the planned next optimization to close this gap.
 
 ### 5.7 Graph parameters
 
@@ -419,6 +444,7 @@ Tests use synthetic random graphs generated internally — no external files nee
 | baseline_known_graph | 4 | hand-crafted |
 | baseline_incremental_edges | 64 | 1 (ring) + 10 random |
 | baseline_random_graph_timing | 256 | 8 |
-| pim_* and stats_* | 256 | 8 |
+| pim_* and stats_pim_vs_cpu | 256 | 8 |
+| stats_cpu_dram_simulated | 256 | 8 |
 
 To change graph size or density, edit the `const int N` and `avg_deg` values at the top of each test in `src/tests/PageRankTestCases.cpp`, then rebuild with `scons`.

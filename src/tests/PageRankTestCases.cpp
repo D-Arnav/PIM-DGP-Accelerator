@@ -37,6 +37,8 @@ class PageRankFixture : public testing::Test
 
     // mem_ is kept so we can read memory stats after runPIM()
     shared_ptr<MultiChannelMemorySystem> mem_;
+    // mem_cpu_ is used to simulate CPU memory accesses through plain DRAM (no PIM ops)
+    shared_ptr<MultiChannelMemorySystem> mem_cpu_;
 
     // Create a PIMKernel backed by the 64-channel HBM2 system.
     shared_ptr<PIMKernel> make_pim_kernel(int num_vertices)
@@ -144,6 +146,163 @@ class PageRankFixture : public testing::Test
         cout <<   "  ╚══════════════════════════╩═══════════════════════════╝" << endl;
         cout <<   "  Note: CPU uses sparse iteration (edges only)." << endl;
         cout <<   "        PIM uses dense N×N matrix (current impl)." << endl;
+    }
+
+    // -----------------------------------------------------------------------
+    // CPU-on-DRAM simulation:
+    // Issues the CPU PageRank memory access pattern as plain DRAM transactions
+    // (no PIM instructions) so we get cycle-accurate simulated cycle counts
+    // for the CPU baseline — making comparison with PIM apples-to-apples.
+    // -----------------------------------------------------------------------
+    struct CPUDRAMStats
+    {
+        uint64_t cycles;
+        uint64_t total_reads;
+        uint64_t total_writes;
+        double   data_moved_MB;
+        double   sim_time_ns;
+        int      iterations;
+    };
+
+    CPUDRAMStats simulateCPUOnDRAM(const PageRankGraph& g,
+                                   float damping  = 0.85f,
+                                   float tol      = 1e-4f,
+                                   int   max_iter = 100)
+    {
+        const int N = g.numVertices();
+
+        // Build flat adjacency offsets so we can address each edge in memory
+        vector<int> adj_offset(N + 1, 0);
+        for (int u = 0; u < N; u++)
+            adj_offset[u + 1] = adj_offset[u] + g.outDegree(u);
+
+        // Fresh DRAMSim2 instance — we never issue any PIM-mode transactions,
+        // so this runs as plain HBM2 DRAM with normal read/write scheduling.
+        mem_cpu_ = make_shared<MultiChannelMemorySystem>(
+            "ini/HBM2_samsung_2M_16B_x64.ini", "system_hbm_64ch.ini", ".",
+            "cpu_pagerank", max(256 * 64 * 2, 4));
+
+        uint32_t burst_bytes = getConfigParam(UINT, "BL") *
+                               getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") / 8;
+
+        // Virtual address layout — 4 bytes per element
+        const uint64_t base_rank    = 0x000000ULL;  // rank[N]
+        const uint64_t base_newrank = 0x100000ULL;  // new_rank[N]
+        const uint64_t base_adj     = 0x200000ULL;  // flattened adjacency list
+        const uint64_t base_deg     = 0x300000ULL;  // out_deg[N]
+
+        auto align_addr = [&](uint64_t a) { return (a / burst_bytes) * burst_bytes; };
+
+        vector<float> rank(N, 1.0f / N), new_rank(N);
+        const float base = (1.0f - damping) / N;
+        uint64_t total_cycles = 0;
+        int iters = 0;
+        BurstType dummy;  // payload for write transactions (timing-only, content unused)
+
+        for (int iter = 0; iter < max_iter; iter++)
+        {
+            iters++;
+
+            // Collect unique burst-aligned addresses touched this iteration.
+            // Using a set deduplicates accesses within the same 32-byte burst
+            // (same as a single DRAM transaction in hardware).
+            set<uint64_t> reads, writes;
+
+            for (int u = 0; u < N; u++)
+            {
+                reads.insert(align_addr(base_rank + u * 4));
+                reads.insert(align_addr(base_deg  + u * 4));
+                writes.insert(align_addr(base_newrank + u * 4));
+            }
+            for (int u = 0; u < N; u++)
+                for (int i = 0; i < g.outDegree(u); i++)
+                    reads.insert(align_addr(base_adj + (adj_offset[u] + i) * 4));
+
+            for (uint64_t addr : reads)  mem_cpu_->addTransaction(false, addr, &dummy);
+            for (uint64_t addr : writes) mem_cpu_->addTransaction(true,  addr, &dummy);
+
+            // Tick the DRAM simulator until all transactions for this iter drain
+            while (mem_cpu_->hasPendingTransactions())
+            {
+                total_cycles++;
+                mem_cpu_->update();
+            }
+
+            // Compute actual PageRank values to track convergence
+            float dangling = 0.0f;
+            for (int u = 0; u < N; u++)
+                if (g.outDegree(u) == 0) dangling += rank[u];
+            fill(new_rank.begin(), new_rank.end(), base + damping * dangling / N);
+            for (int u = 0; u < N; u++)
+            {
+                if (g.outDegree(u) == 0) continue;
+                float share = damping * rank[u] / g.outDegree(u);
+                for (int v : g.outNeighbors(u)) new_rank[v] += share;
+            }
+            float diff = 0.0f;
+            for (int v = 0; v < N; v++) diff += fabs(new_rank[v] - rank[v]);
+            swap(rank, new_rank);
+            if (diff < tol) break;
+        }
+
+        CPUDRAMStats s;
+        s.cycles     = total_cycles;
+        s.iterations = iters;
+        s.total_reads = s.total_writes = 0;
+        int num_chans = getConfigParam(UINT, "NUM_CHANS");
+        for (int i = 0; i < num_chans; i++)
+        {
+            s.total_reads  += mem_cpu_->channels[i]->memoryController->totalReads;
+            s.total_writes += mem_cpu_->channels[i]->memoryController->totalWrites;
+        }
+        s.data_moved_MB = (double)(s.total_reads + s.total_writes) *
+                          burst_bytes / (1024.0 * 1024.0);
+        s.sim_time_ns   = total_cycles * (double)getConfigParam(FLOAT, "tCK");
+        return s;
+    }
+
+    // Unified table: both sides now have real simulated cycle counts.
+    void printUnifiedTable(const CPUDRAMStats& cpu, const PIMStats& pim, int N, int pim_iters)
+    {
+        uint64_t burst_bytes = getConfigParam(UINT, "BL") *
+                               getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") / 8;
+        double cpu_bw = (cpu.sim_time_ns > 0)
+                        ? (cpu.total_reads + cpu.total_writes) * burst_bytes / cpu.sim_time_ns
+                        : 0.0;
+        double pim_bw = (pim.sim_time_ns > 0)
+                        ? (pim.total_reads + pim.total_writes) * burst_bytes / pim.sim_time_ns
+                        : 0.0;
+        double speedup = (pim.sim_time_ns > 0 && cpu.sim_time_ns > 0)
+                         ? cpu.sim_time_ns / pim.sim_time_ns : 0.0;
+
+        cout << "\n  ╔══════════════════════════════════════════════════════════════╗" << endl;
+        cout <<   "  ║     Stats Comparison (N=" << N << ", both through HBM2 DRAM sim)  ║" << endl;
+        cout <<   "  ╠══════════════════════════╦═══════════════╦═════════════════╣" << endl;
+        cout <<   "  ║ Metric                   ║ CPU (no PIM)  ║ PIM             ║" << endl;
+        cout <<   "  ╠══════════════════════════╬═══════════════╬═════════════════╣" << endl;
+        cout <<   "  ║ Iterations               ║ " << setw(13) << cpu.iterations
+             <<   " ║ " << setw(15) << pim_iters << " ║" << endl;
+        cout <<   "  ║ Simulated cycles         ║ " << setw(13) << cpu.cycles
+             <<   " ║ " << setw(15) << pim.cycles << " ║" << endl;
+        cout <<   "  ║ Simulated time (ns)      ║ " << setw(13) << fixed << setprecision(1)
+             <<   cpu.sim_time_ns
+             <<   " ║ " << setw(15) << pim.sim_time_ns << " ║" << endl;
+        cout <<   "  ║ Memory reads (txns)      ║ " << setw(13) << cpu.total_reads
+             <<   " ║ " << setw(15) << pim.total_reads << " ║" << endl;
+        cout <<   "  ║ Memory writes (txns)     ║ " << setw(13) << cpu.total_writes
+             <<   " ║ " << setw(15) << pim.total_writes << " ║" << endl;
+        cout <<   "  ║ Data moved (MB)          ║ " << setw(13) << fixed << setprecision(2)
+             <<   cpu.data_moved_MB
+             <<   " ║ " << setw(15) << pim.data_moved_MB << " ║" << endl;
+        cout <<   "  ║ Memory BW (GB/s)         ║ " << setw(13) << fixed << setprecision(2)
+             <<   cpu_bw
+             <<   " ║ " << setw(15) << pim_bw << " ║" << endl;
+        cout <<   "  ╠══════════════════════════╩═══════════════╩═════════════════╣" << endl;
+        cout <<   "  ║ PIM cycle speedup: " << fixed << setprecision(2) << speedup
+             <<   "x                                    ║" << endl;
+        cout <<   "  ╚════════════════════════════════════════════════════════════╝" << endl;
+        cout <<   "  Note: CPU models sparse access pattern through plain HBM2 DRAM." << endl;
+        cout <<   "        PIM offloads SpMV to in-memory compute (dense matrix)." << endl;
     }
 };
 
@@ -676,6 +835,77 @@ TEST_F(PageRankFixture, stats_pim_vs_cpu)
     // Sanity checks
     EXPECT_GT(pim_s.cycles, 0ULL);
     EXPECT_GT(pim_s.total_reads, 0ULL);
+}
+
+// ===========================================================================
+// Test 8: CPU-DRAM simulated vs PIM — apples-to-apples cycle comparison
+//
+// Both versions run through the same HBM2 DRAM simulator so we can compare
+// actual simulated cycle counts directly.
+//
+// CPU: issues sparse read/write transactions per iteration (no PIM ops).
+// PIM: offloads SpMV to in-memory compute units (dense matrix).
+// ===========================================================================
+
+TEST_F(PageRankFixture, stats_cpu_dram_simulated)
+{
+    cout << "\n>> PageRank Stats: CPU (DRAM simulated) vs PIM (N=256)" << endl;
+
+    const int N = 256;
+    const float damping = 0.85f, tol = 1e-4f;
+    const int max_iter = 100;
+    const float base_val = (1.0f - damping) / N;
+
+    PageRankGraph g = PageRankGraph::randomGraph(N, 8.0, 42);
+    int total_edges = 0;
+    for (int u = 0; u < N; u++) total_edges += g.outDegree(u);
+
+    cout << "  Graph: N=" << N << "  edges=" << total_edges
+         << "  avg_deg=" << fixed << setprecision(1) << (double)total_edges / N << endl;
+
+    // Run CPU PageRank with memory accesses routed through DRAMSim (no PIM)
+    CPUDRAMStats cpu_s = simulateCPUOnDRAM(g, damping, tol, max_iter);
+    cout << "  CPU converged in " << cpu_s.iterations << " iters" << endl;
+
+    // Run PIM PageRank
+    shared_ptr<PIMKernel> kernel = make_pim_kernel(N);
+    NumpyBurstType weight_npbst, input_npbst;
+    g.buildTransitionMatrix(weight_npbst);
+
+    vector<float> pim_rank(N, 1.0f / N);
+    int pim_iters = 0;
+
+    for (int iter = 0; iter < max_iter; iter++)
+    {
+        pim_iters++;
+        input_npbst.bData.clear(); input_npbst.bShape.clear(); input_npbst.shape.clear();
+        g.buildRankVector(pim_rank, input_npbst);
+
+        kernel->preloadGemv(&weight_npbst);
+        kernel->executeGemv(&weight_npbst, &input_npbst, false);
+
+        unsigned end_col = kernel->getResultColGemv(N / 16, N);
+        BurstType* raw = new BurstType[N];
+        kernel->readResult(raw, pimBankType::ODD_BANK, N, 0, 0, end_col);
+        kernel->runPIM();
+
+        vector<float> new_rank(N);
+        for (int v = 0; v < N; v++)
+            new_rank[v] = base_val + damping * convertH2F(raw[v].fp16ReduceSum());
+        delete[] raw;
+
+        float diff = 0.0f;
+        for (int v = 0; v < N; v++) diff += fabs(new_rank[v] - pim_rank[v]);
+        pim_rank = new_rank;
+        if (diff < tol) break;
+    }
+    cout << "  PIM converged in " << pim_iters << " iters" << endl;
+
+    PIMStats pim_s = getPIMStats(kernel);
+    printUnifiedTable(cpu_s, pim_s, N, pim_iters);
+
+    EXPECT_GT(cpu_s.cycles, 0ULL);
+    EXPECT_GT(pim_s.cycles, 0ULL);
 }
 
 // ===========================================================================
