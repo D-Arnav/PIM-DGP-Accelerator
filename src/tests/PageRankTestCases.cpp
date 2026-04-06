@@ -163,103 +163,287 @@ class PageRankFixture : public testing::Test
         double   sim_time_ns;
         int      iterations;
     };
+CPUDRAMStats simulateCPUOnDRAM_Dense(const PageRankGraph& g,
+                                     float damping  = 0.85f,
+                                     float tol      = 1e-4f,
+                                     int   max_iter = 100)
+{
+    const int N = g.numVertices();
 
-    CPUDRAMStats simulateCPUOnDRAM(const PageRankGraph& g,
-                                   float damping  = 0.85f,
-                                   float tol      = 1e-4f,
-                                   int   max_iter = 100)
+    // -------------------------------------------------------------
+    // 1. Build the Dense O(V^2) Transition Matrix (Host memory)
+    // -------------------------------------------------------------
+    vector<vector<float>> M(N, vector<float>(N, 0.0f));
+    const float base = (1.0f - damping) / N;
+
+    for (int u = 0; u < N; u++)
     {
-        const int N = g.numVertices();
-
-        // Build flat adjacency offsets so we can address each edge in memory
-        vector<int> adj_offset(N + 1, 0);
-        for (int u = 0; u < N; u++)
-            adj_offset[u + 1] = adj_offset[u] + g.outDegree(u);
-
-        // Fresh DRAMSim2 instance — we never issue any PIM-mode transactions,
-        // so this runs as plain HBM2 DRAM with normal read/write scheduling.
-        mem_cpu_ = make_shared<MultiChannelMemorySystem>(
-            "ini/HBM2_samsung_2M_16B_x64.ini", "system_hbm_64ch.ini", ".",
-            "cpu_pagerank", max(256 * 64 * 2, 4));
-
-        uint32_t burst_bytes = getConfigParam(UINT, "BL") *
-                               getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") / 8;
-
-        // Virtual address layout — 4 bytes per element
-        const uint64_t base_rank    = 0x000000ULL;  // rank[N]
-        const uint64_t base_newrank = 0x100000ULL;  // new_rank[N]
-        const uint64_t base_adj     = 0x200000ULL;  // flattened adjacency list
-        const uint64_t base_deg     = 0x300000ULL;  // out_deg[N]
-
-        auto align_addr = [&](uint64_t a) { return (a / burst_bytes) * burst_bytes; };
-
-        vector<float> rank(N, 1.0f / N), new_rank(N);
-        const float base = (1.0f - damping) / N;
-        uint64_t total_cycles = 0;
-        int iters = 0;
-        BurstType dummy;  // payload for write transactions (timing-only, content unused)
-
-        for (int iter = 0; iter < max_iter; iter++)
+        if (g.outDegree(u) == 0)
         {
-            iters++;
-
-            // Collect unique burst-aligned addresses touched this iteration.
-            // Using a set deduplicates accesses within the same 32-byte burst
-            // (same as a single DRAM transaction in hardware).
-            set<uint64_t> reads, writes;
-
-            for (int u = 0; u < N; u++)
-            {
-                reads.insert(align_addr(base_rank + u * 4));
-                reads.insert(align_addr(base_deg  + u * 4));
-                writes.insert(align_addr(base_newrank + u * 4));
-            }
-            for (int u = 0; u < N; u++)
-                for (int i = 0; i < g.outDegree(u); i++)
-                    reads.insert(align_addr(base_adj + (adj_offset[u] + i) * 4));
-
-            for (uint64_t addr : reads)  mem_cpu_->addTransaction(false, addr, &dummy);
-            for (uint64_t addr : writes) mem_cpu_->addTransaction(true,  addr, &dummy);
-
-            // Tick the DRAM simulator until all transactions for this iter drain
-            while (mem_cpu_->hasPendingTransactions())
-            {
-                total_cycles++;
-                mem_cpu_->update();
-            }
-
-            // Compute actual PageRank values to track convergence
-            float dangling = 0.0f;
-            for (int u = 0; u < N; u++)
-                if (g.outDegree(u) == 0) dangling += rank[u];
-            fill(new_rank.begin(), new_rank.end(), base + damping * dangling / N);
-            for (int u = 0; u < N; u++)
-            {
-                if (g.outDegree(u) == 0) continue;
-                float share = damping * rank[u] / g.outDegree(u);
-                for (int v : g.outNeighbors(u)) new_rank[v] += share;
-            }
-            float diff = 0.0f;
-            for (int v = 0; v < N; v++) diff += fabs(new_rank[v] - rank[v]);
-            swap(rank, new_rank);
-            if (diff < tol) break;
+            float val = damping * (1.0f / N);
+            for (int v = 0; v < N; v++)
+                M[v][u] = base + val;
         }
-
-        CPUDRAMStats s;
-        s.cycles     = total_cycles;
-        s.iterations = iters;
-        s.total_reads = s.total_writes = 0;
-        int num_chans = getConfigParam(UINT, "NUM_CHANS");
-        for (int i = 0; i < num_chans; i++)
+        else
         {
-            s.total_reads  += mem_cpu_->channels[i]->memoryController->totalReads;
-            s.total_writes += mem_cpu_->channels[i]->memoryController->totalWrites;
+            for (int v = 0; v < N; v++)
+                M[v][u] = base;
+
+            float share = damping / g.outDegree(u);
+            for (int v : g.outNeighbors(u))
+                M[v][u] += share;
         }
-        s.data_moved_MB = (double)(s.total_reads + s.total_writes) *
-                          burst_bytes / (1024.0 * 1024.0);
-        s.sim_time_ns   = total_cycles * (double)getConfigParam(FLOAT, "tCK");
-        return s;
     }
+
+    // -------------------------------------------------------------
+    // 2. Hardware Simulation Setup
+    // -------------------------------------------------------------
+    // Fresh DRAMSim instance
+    auto mem_cpu_ = make_shared<MultiChannelMemorySystem>(
+        "ini/HBM2_samsung_2M_16B_x64.ini", "system_hbm_64ch.ini", ".",
+        "cpu_pagerank_dense", max(256 * 64 * 2, 4));
+
+    uint32_t burst_bytes =
+        getConfigParam(UINT, "BL") *
+        getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") / 8;
+
+    // Address layout
+    const uint64_t base_rank    = 0x000000ULL;
+    const uint64_t base_newrank = 0x100000ULL;
+    const uint64_t base_matrix  = 0x200000ULL; // Dense matrix starts here
+
+    auto align_addr = [&](uint64_t a) {
+        return (a / burst_bytes) * burst_bytes;
+    };
+
+    vector<float> rank(N, 1.0f / N), new_rank(N);
+
+    uint64_t total_cycles = 0;
+    int iters = 0;
+    BurstType dummy;
+
+    // Helper: issue request with backpressure handling
+    auto issue_and_tick = [&](bool is_write, uint64_t addr) {
+        while (!mem_cpu_->addTransaction(is_write, addr, &dummy)) {
+            total_cycles++;
+            mem_cpu_->update();
+        }
+    };
+
+    // -------------------------------------------------------------
+    // 3. Iterative Execution Loop
+    // -------------------------------------------------------------
+    for (int iter = 0; iter < max_iter; iter++)
+    {
+        iters++;
+        fill(new_rank.begin(), new_rank.end(), 0.0f);
+
+        for (int v = 0; v < N; v++)
+        {
+            uint64_t waddr = align_addr(base_newrank + v * 4);
+            issue_and_tick(false, waddr);  // RFO read for new_rank[v]
+
+            for (int u = 0; u < N; u++)
+            {
+                // Memory Sim: Read dense matrix element M[v][u]
+                uint64_t m_addr = base_matrix + (v * N + u) * 4;
+                issue_and_tick(false, align_addr(m_addr));
+
+                // Memory Sim: Read rank[u]
+                // (Assuming an imperfect cache here to mirror raw DRAM streaming)
+                issue_and_tick(false, align_addr(base_rank + u * 4));
+
+                // Functional Math: Dense Matrix-Vector Accumulation
+                new_rank[v] += M[v][u] * rank[u];
+            }
+
+            // Write updated new_rank[v] back to DRAM
+            issue_and_tick(true, waddr);
+        }
+
+        // Drain remaining transactions in the memory controller
+        while (mem_cpu_->hasPendingTransactions())
+        {
+            total_cycles++;
+            mem_cpu_->update();
+        }
+
+        // ---------------------------
+        // Check Convergence
+        // ---------------------------
+        float diff = 0.0f;
+        for (int v = 0; v < N; v++) {
+            diff += fabs(new_rank[v] - rank[v]);
+        }
+
+        swap(rank, new_rank);
+        if (diff < tol) break;
+    }
+
+    // -------------------------------------------------------------
+    // 4. Collect Stats
+    // -------------------------------------------------------------
+    CPUDRAMStats s;
+    s.cycles     = total_cycles;
+    s.iterations = iters;
+    s.total_reads = s.total_writes = 0;
+
+    int num_chans = getConfigParam(UINT, "NUM_CHANS");
+    for (int i = 0; i < num_chans; i++)
+    {
+        s.total_reads  +=
+            mem_cpu_->channels[i]->memoryController->totalReads;
+        s.total_writes +=
+            mem_cpu_->channels[i]->memoryController->totalWrites;
+    }
+
+    s.data_moved_MB =
+        (double)(s.total_reads + s.total_writes) *
+        burst_bytes / (1024.0 * 1024.0);
+
+    s.sim_time_ns =
+        total_cycles * (double)getConfigParam(FLOAT, "tCK");
+
+    return s;
+}
+
+CPUDRAMStats simulateCPUOnDRAM(const PageRankGraph& g,
+                               float damping  = 0.85f,
+                               float tol      = 1e-4f,
+                               int   max_iter = 100)
+{
+    const int N = g.numVertices();
+
+    // Build CSR-style offsets
+    vector<int> adj_offset(N + 1, 0);
+    for (int u = 0; u < N; u++)
+        adj_offset[u + 1] = adj_offset[u] + g.outDegree(u);
+
+    // Fresh DRAMSim instance
+    mem_cpu_ = make_shared<MultiChannelMemorySystem>(
+        "ini/HBM2_samsung_2M_16B_x64.ini", "system_hbm_64ch.ini", ".",
+        "cpu_pagerank", max(256 * 64 * 2, 4));
+
+    uint32_t burst_bytes =
+        getConfigParam(UINT, "BL") *
+        getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") / 8;
+
+    // Address layout
+    const uint64_t base_rank    = 0x000000ULL;
+    const uint64_t base_newrank = 0x100000ULL;
+    const uint64_t base_adj     = 0x200000ULL;
+    const uint64_t base_deg     = 0x300000ULL;
+
+    auto align_addr = [&](uint64_t a) {
+        return (a / burst_bytes) * burst_bytes;
+    };
+
+    vector<float> rank(N, 1.0f / N), new_rank(N);
+    const float base = (1.0f - damping) / N;
+
+    uint64_t total_cycles = 0;
+    int iters = 0;
+    BurstType dummy;
+
+    // Helper: issue request with backpressure handling
+    auto issue_and_tick = [&](bool is_write, uint64_t addr) {
+        while (!mem_cpu_->addTransaction(is_write, addr, &dummy)) {
+            total_cycles++;
+            mem_cpu_->update();
+        }
+    };
+
+    for (int iter = 0; iter < max_iter; iter++)
+    {
+        iters++;
+
+        // ---------------------------
+        // Memory access simulation
+        // ---------------------------
+        for (int u = 0; u < N; u++)
+        {
+            // Read rank[u] and degree[u]
+            issue_and_tick(false, align_addr(base_rank + u * 4));
+            issue_and_tick(false, align_addr(base_deg  + u * 4));
+
+            // Stream adjacency list
+            for (int i = 0; i < g.outDegree(u); i++)
+            {
+                uint64_t addr =
+                    base_adj + (adj_offset[u] + i) * 4;
+                issue_and_tick(false, align_addr(addr));
+            }
+
+            // Write new_rank[u]
+            uint64_t waddr = align_addr(base_newrank + u * 4);
+
+            // Optional: model Read-For-Ownership (RFO)
+            issue_and_tick(false, waddr);  // RFO read
+            issue_and_tick(true,  waddr);  // write
+        }
+
+        // Drain remaining transactions
+        while (mem_cpu_->hasPendingTransactions())
+        {
+            total_cycles++;
+            mem_cpu_->update();
+        }
+
+        // ---------------------------
+        // Functional PageRank update
+        // ---------------------------
+        float dangling = 0.0f;
+        for (int u = 0; u < N; u++)
+            if (g.outDegree(u) == 0)
+                dangling += rank[u];
+
+        fill(new_rank.begin(), new_rank.end(),
+             base + damping * dangling / N);
+
+        for (int u = 0; u < N; u++)
+        {
+            int deg = g.outDegree(u);
+            if (deg == 0) continue;
+
+            float share = damping * rank[u] / deg;
+            for (int v : g.outNeighbors(u))
+                new_rank[v] += share;
+        }
+
+        float diff = 0.0f;
+        for (int v = 0; v < N; v++)
+            diff += fabs(new_rank[v] - rank[v]);
+
+        swap(rank, new_rank);
+        if (diff < tol) break;
+    }
+
+    // ---------------------------
+    // Collect stats
+    // ---------------------------
+    CPUDRAMStats s;
+    s.cycles     = total_cycles;
+    s.iterations = iters;
+    s.total_reads = s.total_writes = 0;
+
+    int num_chans = getConfigParam(UINT, "NUM_CHANS");
+    for (int i = 0; i < num_chans; i++)
+    {
+        s.total_reads  +=
+            mem_cpu_->channels[i]->memoryController->totalReads;
+        s.total_writes +=
+            mem_cpu_->channels[i]->memoryController->totalWrites;
+    }
+
+    s.data_moved_MB =
+        (double)(s.total_reads + s.total_writes) *
+        burst_bytes / (1024.0 * 1024.0);
+
+    s.sim_time_ns =
+        total_cycles * (double)getConfigParam(FLOAT, "tCK");
+
+    return s;
+}
 
     // Unified table: both sides now have real simulated cycle counts.
     void printUnifiedTable(const CPUDRAMStats& cpu, const PIMStats& pim, int N, int pim_iters)
@@ -864,7 +1048,7 @@ TEST_F(PageRankFixture, stats_cpu_dram_simulated)
          << "  avg_deg=" << fixed << setprecision(1) << (double)total_edges / N << endl;
 
     // Run CPU PageRank with memory accesses routed through DRAMSim (no PIM)
-    CPUDRAMStats cpu_s = simulateCPUOnDRAM(g, damping, tol, max_iter);
+    CPUDRAMStats cpu_s = simulateCPUOnDRAM_Dense(g, damping, tol, max_iter);
     cout << "  CPU converged in " << cpu_s.iterations << " iters" << endl;
 
     // Run PIM PageRank
@@ -973,12 +1157,23 @@ TEST_F(PageRankFixture, real_world_incremental_pagerank)
     const float base = (1.0f - damping) / N;
 
     // PIM helper lambda for timing and convergence
-    auto runPIMPageRank = [&](const vector<float>& init, shared_ptr<PIMKernel> kernel, double& sim_time_ms) -> pair<vector<float>, int>
+    auto runPIMPageRank = [&](const vector<float>& init_rank, 
+                              shared_ptr<PIMKernel> kernel, 
+                              double& sim_time_ms, 
+                              bool is_incremental = false) -> pair<vector<float>, int>
     {
         NumpyBurstType weight_npbst, input_npbst;
-        g.buildTransitionMatrix(weight_npbst);
+        g.buildTransitionMatrix(weight_npbst, damping); // Pass damping to ensure matrix is built correctly
 
-        vector<float> rank = init;
+        kernel->preloadGemv(&weight_npbst);
+
+        vector<float> rank = init_rank;
+        vector<float> current_input = init_rank;
+        
+        if (is_incremental) {
+            current_input = g.getIncrementalDelta(rank, damping);
+        }
+
         int iters = 0;
         auto start = chrono::high_resolution_clock::now();
 
@@ -988,24 +1183,41 @@ TEST_F(PageRankFixture, real_world_incremental_pagerank)
             input_npbst.bData.clear();
             input_npbst.bShape.clear();
             input_npbst.shape.clear();
-            g.buildRankVector(rank, input_npbst);
+            
+            // Build the input burst using either absolute R (Cold) or ΔR (Warm)
+            g.buildRankVector(current_input, input_npbst);
 
-            kernel->preloadGemv(&weight_npbst);
+            // Execute GEMV using the PRELOADED weights
             kernel->executeGemv(&weight_npbst, &input_npbst, false);
 
             unsigned end_col = kernel->getResultColGemv(N / 16, N);
-            BurstType* raw = new BurstType[N];
-            kernel->readResult(raw, pimBankType::ODD_BANK, N, 0, 0, end_col);
+            
+            // Use std::vector for safe memory management
+            std::vector<BurstType> raw(N);
+            kernel->readResult(raw.data(), pimBankType::ODD_BANK, N, 0, 0, end_col);
             kernel->runPIM();
 
-            vector<float> new_rank(N);
-            for (int v = 0; v < N; v++)
-                new_rank[v] = base + damping * convertH2F(raw[v].fp16ReduceSum());
-            delete[] raw;
-
+            vector<float> new_vec(N);
             float diff = 0.0f;
-            for (int v = 0; v < N; v++) diff += fabs(new_rank[v] - rank[v]);
-            rank = new_rank;
+            
+            for (int v = 0; v < N; v++) {
+                // Since buildTransitionMatrix incorporates base and damping, 
+                // the GEMV reduction is our exact new vector.
+                new_vec[v] = convertH2F(raw[v].fp16ReduceSum());
+                
+                if (is_incremental) {
+                    rank[v] += new_vec[v];       // Update the absolute rank
+                    diff += fabs(new_vec[v]);    // Error is the magnitude of the delta
+                } else {
+                    // For Standard PageRank: input is R, output is next R.
+                    diff += fabs(new_vec[v] - rank[v]); 
+                    rank[v] = new_vec[v];
+                }
+            }
+            
+            // Next iteration's input is the output of this iteration
+            current_input = new_vec;
+            
             if (diff < tol) break;
         }
 
@@ -1020,16 +1232,18 @@ TEST_F(PageRankFixture, real_world_incremental_pagerank)
     vector<float> uniform_init(N, 1.0f / N);
     
     // CPU
-    auto cpu_start_cold = chrono::high_resolution_clock::now();
-    vector<float> cpu_rank_cold = g.runPageRankCPU(damping, tol, max_iter);
-    double cpu_time_cold = chrono::duration<double, milli>(chrono::high_resolution_clock::now() - cpu_start_cold).count();
-
+    CPUDRAMStats cpu_cold_s = simulateCPUOnDRAM_Dense(g, damping, tol, max_iter);
+    cout << "  CPU Cold Start: " << cpu_cold_s.cycles
+         << " cycles (" << cpu_cold_s.sim_time_ns << " ns, "
+         << cpu_cold_s.iterations << " iters)" << endl;
+         
     // PIM
     shared_ptr<PIMKernel> kernel = make_pim_kernel(N);
     double pim_time_cold = 0.0;
+    // Cold start -> is_incremental defaults to false
     auto [pim_rank_cold, pim_iters_cold] = runPIMPageRank(uniform_init, kernel, pim_time_cold);
 
-// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
     // Stage B: Incremental Update (Warm Start)
     // -----------------------------------------------------------------------
     int inserted = 0;
@@ -1040,9 +1254,10 @@ TEST_F(PageRankFixture, real_world_incremental_pagerank)
     cout << "  Inserted " << inserted << " new edges dynamically." << endl;
 
     // CPU Incremental
-    auto cpu_start_warm = chrono::high_resolution_clock::now();
-    vector<float> cpu_rank_warm = g.runPageRankCPU(damping, tol, max_iter, &cpu_rank_cold);
-    double cpu_time_warm = chrono::duration<double, milli>(chrono::high_resolution_clock::now() - cpu_start_warm).count();
+    CPUDRAMStats cpu_warm_s = simulateCPUOnDRAM_Dense(g, damping, tol, max_iter);
+    cout << "  CPU Warm Start: " << cpu_warm_s.cycles
+         << " cycles (" << cpu_warm_s.sim_time_ns << " ns, "
+         << cpu_warm_s.iterations << " iters)" << endl;
 
     // PIM Incremental
     // [!] CRITICAL FIX: Explicitly destroy the old simulator states to release
@@ -1054,11 +1269,14 @@ TEST_F(PageRankFixture, real_world_incremental_pagerank)
     kernel = make_pim_kernel(N); 
     
     double pim_time_warm = 0.0;
-    auto [pim_rank_warm, pim_iters_warm] = runPIMPageRank(pim_rank_cold, kernel, pim_time_warm);
+    
+    // [!] Added 'true' here to activate the Delta PageRank strategy
+    auto [pim_rank_warm, pim_iters_warm] = runPIMPageRank(pim_rank_cold, kernel, pim_time_warm, true);
     
     // -----------------------------------------------------------------------
     // Verification & Results
     // -----------------------------------------------------------------------
+    vector<float> cpu_rank_warm = g.runPageRankCPU(damping, tol, max_iter);
     float max_diff = 0.0f;
     for (int v = 0; v < N; v++) {
         max_diff = max(max_diff, fabs(cpu_rank_warm[v] - pim_rank_warm[v]));
@@ -1066,15 +1284,12 @@ TEST_F(PageRankFixture, real_world_incremental_pagerank)
     EXPECT_LT(max_diff, 0.01f); // Account for FP16 accumulation drift
 
     cout << "\n  [ Performance Benchmarks ]" << endl;
-    cout << "  CPU Cold Start Time: " << cpu_time_cold << " ms" << endl;
     cout << "  PIM Cold Start Time: " << pim_time_cold << " ms (" << pim_iters_cold << " iters)" << endl;
     cout << "  ---" << endl;
-    cout << "  CPU Warm Start Time: " << cpu_time_warm << " ms" << endl;
     cout << "  PIM Warm Start Time: " << pim_time_warm << " ms (" << pim_iters_warm << " iters)" << endl;
     cout << "  Max PIM drift vs CPU : " << max_diff << endl;
 
     // Fetch memory system telemetry
-    CPUStats cpu_s = getCPUStats(N, pim_iters_warm, all_edges.size());
     PIMStats pim_s = getPIMStats(kernel);
-    printStatsTable(pim_s, cpu_s, N);
+    printUnifiedTable(cpu_warm_s, pim_s, N, pim_iters_warm);
 }
