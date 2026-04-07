@@ -1293,3 +1293,179 @@ TEST_F(PageRankFixture, real_world_incremental_pagerank)
     PIMStats pim_s = getPIMStats(kernel);
     printUnifiedTable(cpu_warm_s, pim_s, N, pim_iters_warm);
 }
+
+// ===========================================================================
+// Test 9: PIM vs CPU - Real-world graph (web-Google) with Incremental Updates
+//
+// Loads directed edges from the Google web graph (875K nodes, 5.1M edges).
+// Due to the dense N x N matrix limitation of the current PIM kernel layout,
+// the graph is constrained to a subset of nodes so cycle-accurate simulations
+// can finish in a reasonable timeframe.
+// ===========================================================================
+
+TEST_F(PageRankFixture, real_world_web_google_pagerank)
+{
+    cout << "\n>> PageRank Real-World: web-Google.txt (Incremental)" << endl;
+
+    const string filename = "src/tests/web-Google.txt";
+    const int MAX_NODES = 512; // Constrain dense matrix size for simulation speed
+
+    std::ifstream infile(filename);
+    ASSERT_TRUE(infile.is_open()) << "  [!] Could not open " << filename << ". Please ensure it is in the working directory.";
+
+    std::unordered_map<int, int> id_map;
+    std::vector<std::pair<int, int>> all_edges;
+    int next_id = 0;
+    std::string line;
+
+    // 1. Parse File and Map IDs
+    while (std::getline(infile, line))
+    {
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+        int u_raw, v_raw;
+        if (!(iss >> u_raw >> v_raw)) continue;
+
+        if (id_map.find(u_raw) == id_map.end() && next_id < MAX_NODES) id_map[u_raw] = next_id++;
+        if (id_map.find(v_raw) == id_map.end() && next_id < MAX_NODES) id_map[v_raw] = next_id++;
+
+        if (id_map.find(u_raw) != id_map.end() && id_map.find(v_raw) != id_map.end())
+            all_edges.push_back({id_map[u_raw], id_map[v_raw]});
+    }
+
+    // 2. Pad N to a multiple of 16 for NumpyBurstType lane alignment
+    int N = next_id;
+    if (N % 16 != 0) N = (N + 15) / 16 * 16;
+
+    cout << "  Loaded " << all_edges.size() << " edges across " << N
+         << " padded nodes (sub-graph max: " << MAX_NODES << ")." << endl;
+
+    // Split edges: 85% for the base graph, 15% for the incremental update
+    int base_edge_count = (int)(all_edges.size() * 0.85);
+    PageRankGraph g(N);
+
+    for (int i = 0; i < base_edge_count; i++)
+        g.addEdge(all_edges[i].first, all_edges[i].second);
+
+    const float damping  = 0.85f;
+    const float tol      = 1e-4f;
+    const int   max_iter = 100;
+    const float base     = (1.0f - damping) / N;
+
+    // PIM helper lambda for timing and convergence
+    auto runPIMPageRank = [&](const vector<float>& init_rank,
+                              shared_ptr<PIMKernel> kernel,
+                              double& sim_time_ms,
+                              bool is_incremental = false) -> pair<vector<float>, int>
+    {
+        NumpyBurstType weight_npbst, input_npbst;
+        g.buildTransitionMatrix(weight_npbst, damping);
+        kernel->preloadGemv(&weight_npbst);
+
+        vector<float> rank = init_rank;
+        vector<float> current_input = init_rank;
+
+        if (is_incremental)
+            current_input = g.getIncrementalDelta(rank, damping);
+
+        int iters = 0;
+        auto start = chrono::high_resolution_clock::now();
+
+        for (int iter = 0; iter < max_iter; iter++)
+        {
+            iters++;
+            input_npbst.bData.clear();
+            input_npbst.bShape.clear();
+            input_npbst.shape.clear();
+            g.buildRankVector(current_input, input_npbst);
+
+            kernel->executeGemv(&weight_npbst, &input_npbst, false);
+
+            unsigned end_col = kernel->getResultColGemv(N / 16, N);
+            std::vector<BurstType> raw(N);
+            kernel->readResult(raw.data(), pimBankType::ODD_BANK, N, 0, 0, end_col);
+            kernel->runPIM();
+
+            vector<float> new_vec(N);
+            float diff = 0.0f;
+
+            for (int v = 0; v < N; v++)
+            {
+                new_vec[v] = convertH2F(raw[v].fp16ReduceSum());
+                if (is_incremental)
+                {
+                    rank[v] += new_vec[v];
+                    diff += fabs(new_vec[v]);
+                }
+                else
+                {
+                    diff += fabs(new_vec[v] - rank[v]);
+                    rank[v] = new_vec[v];
+                }
+            }
+
+            current_input = new_vec;
+            if (diff < tol) break;
+        }
+
+        auto end = chrono::high_resolution_clock::now();
+        sim_time_ms = chrono::duration<double, milli>(end - start).count();
+        return {rank, iters};
+    };
+
+    // -----------------------------------------------------------------------
+    // Stage A: Initial Graph Convergence (Cold Start)
+    // -----------------------------------------------------------------------
+    vector<float> uniform_init(N, 1.0f / N);
+
+    CPUDRAMStats cpu_cold_s = simulateCPUOnDRAM_Dense(g, damping, tol, max_iter);
+    cout << "  CPU Cold Start: " << cpu_cold_s.cycles
+         << " cycles (" << cpu_cold_s.sim_time_ns << " ns, "
+         << cpu_cold_s.iterations << " iters)" << endl;
+
+    shared_ptr<PIMKernel> kernel = make_pim_kernel(N);
+    double pim_time_cold = 0.0;
+    auto [pim_rank_cold, pim_iters_cold] = runPIMPageRank(uniform_init, kernel, pim_time_cold);
+
+    // -----------------------------------------------------------------------
+    // Stage B: Incremental Update (Warm Start)
+    // -----------------------------------------------------------------------
+    int inserted = 0;
+    for (size_t i = base_edge_count; i < all_edges.size(); i++)
+    {
+        g.addEdge(all_edges[i].first, all_edges[i].second);
+        inserted++;
+    }
+    cout << "  Inserted " << inserted << " new edges dynamically." << endl;
+
+    CPUDRAMStats cpu_warm_s = simulateCPUOnDRAM_Dense(g, damping, tol, max_iter);
+    cout << "  CPU Warm Start: " << cpu_warm_s.cycles
+         << " cycles (" << cpu_warm_s.sim_time_ns << " ns, "
+         << cpu_warm_s.iterations << " iters)" << endl;
+
+    kernel.reset();
+    mem_.reset();
+    kernel = make_pim_kernel(N);
+
+    double pim_time_warm = 0.0;
+    auto [pim_rank_warm, pim_iters_warm] = runPIMPageRank(pim_rank_cold, kernel, pim_time_warm, true);
+
+    // -----------------------------------------------------------------------
+    // Verification & Results
+    // -----------------------------------------------------------------------
+    vector<float> cpu_rank_warm = g.runPageRankCPU(damping, tol, max_iter);
+    float max_diff = 0.0f;
+    for (int v = 0; v < N; v++)
+        max_diff = max(max_diff, fabs(cpu_rank_warm[v] - pim_rank_warm[v]));
+    EXPECT_LT(max_diff, 0.01f);
+
+    cout << "\n  [ Performance Benchmarks ]" << endl;
+    cout << "  PIM Cold Start Time: " << pim_time_cold << " ms (" << pim_iters_cold << " iters)" << endl;
+    cout << "  ---" << endl;
+    cout << "  PIM Warm Start Time: " << pim_time_warm << " ms (" << pim_iters_warm << " iters)" << endl;
+    cout << "  Max PIM drift vs CPU : " << max_diff << endl;
+
+    PIMStats pim_s = getPIMStats(kernel);
+    printUnifiedTable(cpu_warm_s, pim_s, N, pim_iters_warm);
+}
