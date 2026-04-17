@@ -832,8 +832,9 @@ TEST_F(PageRankFixture, pim_incremental_edge_insertion)
 
     PageRankGraph g = PageRankGraph::randomGraph(N, 6.0, 17);
 
-    // Helper lambda: run PIM PageRank to convergence, return ranks and iter count.
-    auto runPIMPageRank = [&](const vector<float>& init) -> pair<vector<float>, int>
+    // Helper lambda: run PIM PageRank to convergence, return ranks, iter count, and cycle count.
+    struct RunResult { vector<float> rank; int iters; uint64_t cycles; };
+    auto runPIMPageRank = [&](const vector<float>& init) -> RunResult
     {
         shared_ptr<PIMKernel> kernel = make_pim_kernel(N);
 
@@ -869,12 +870,14 @@ TEST_F(PageRankFixture, pim_incremental_edge_insertion)
             rank = new_rank;
             if (diff < tol) break;
         }
-        return {rank, iters};
+        return {rank, iters, kernel->getCycle()};
     };
 
     // Initial convergence
     vector<float> uniform_init(N, 1.0f / N);
-    auto [rank_before, iters_cold] = runPIMPageRank(uniform_init);
+    auto res_initial = runPIMPageRank(uniform_init);
+    vector<float> rank_before = res_initial.rank;
+    int iters_cold = res_initial.iters;
 
     // Insert 16 new edges
     mt19937 rng(55);
@@ -888,10 +891,16 @@ TEST_F(PageRankFixture, pim_incremental_edge_insertion)
     cout << "  Inserted " << inserted << " new edges" << endl;
 
     // Cold re-run
-    auto [rank_cold, iters_cold2] = runPIMPageRank(uniform_init);
+    auto res_cold = runPIMPageRank(uniform_init);
+    vector<float> rank_cold = res_cold.rank;
+    int iters_cold2 = res_cold.iters;
+    uint64_t cycles_cold = res_cold.cycles;
 
     // Warm re-run (incremental: start from old ranks)
-    auto [rank_warm, iters_warm] = runPIMPageRank(rank_before);
+    auto res_warm = runPIMPageRank(rank_before);
+    vector<float> rank_warm = res_warm.rank;
+    int iters_warm = res_warm.iters;
+    uint64_t cycles_warm = res_warm.cycles;
 
     // Both should produce valid rank distributions.
     // FP16 accumulation across N=256 vertices introduces ~0.1% error, so allow 5e-3 tolerance.
@@ -906,10 +915,110 @@ TEST_F(PageRankFixture, pim_incremental_edge_insertion)
         max_diff = max(max_diff, fabs(rank_cold[v] - rank_warm[v]));
     EXPECT_LT(max_diff, 0.01f);
 
-    cout << "  Initial convergence:       " << iters_cold  << " iters" << endl;
-    cout << "  Cold restart (post-insert):" << iters_cold2 << " iters" << endl;
-    cout << "  Warm restart (incremental):" << iters_warm  << " iters" << endl;
+    cout << "  Initial convergence:        " << iters_cold  << " iters" << endl;
+    cout << "  Cold restart (post-insert): " << iters_cold2 << " iters  |  cycles: " << cycles_cold << endl;
+    cout << "  Warm restart (incremental): " << iters_warm  << " iters  |  cycles: " << cycles_warm << endl;
+    cout << "  Cycle reduction (warm vs cold): "
+         << fixed << setprecision(1)
+         << (1.0 - (double)cycles_warm / cycles_cold) * 100.0 << "%" << endl;
     cout << "  Max diff cold vs warm: " << max_diff << endl;
+}
+
+// ===========================================================================
+// Test 6b: Cycle count sweep — warm vs cold restart as edges are inserted
+//
+// Sweeps over increasing batch sizes of inserted edges and records the
+// simulated PIM cycle count for both cold and warm restarts.
+// Output is CSV-ready for plotting.
+// ===========================================================================
+
+TEST_F(PageRankFixture, pim_cycle_sweep_edge_insertion)
+{
+    cout << "\n>> PageRank PIM: cycle sweep over edge insertion batch sizes (N=64)" << endl;
+
+    const int N = 64;
+    const float damping = 0.85f;
+    const float tol = 1e-6f;   // tighter tolerance to expose warm-start benefit
+    const int max_iter = 200;
+    const float base = (1.0f - damping) / N;
+
+    // Batch sizes to sweep
+    vector<int> batch_sizes = {1, 2, 4, 8, 16, 32};
+
+    // One graph, progressively insert edges and measure cold vs warm after each batch
+    PageRankGraph g = PageRankGraph::randomGraph(N, 6.0, 17);
+
+    struct RunResult { vector<float> rank; int iters; uint64_t cycles; };
+    auto runPIM = [&](const vector<float>& init) -> RunResult
+    {
+        shared_ptr<PIMKernel> kernel = make_pim_kernel(N);
+        NumpyBurstType weight_npbst, input_npbst;
+        g.buildTransitionMatrix(weight_npbst);
+        vector<float> rank = init;
+        int iters = 0;
+        for (int iter = 0; iter < max_iter; iter++)
+        {
+            iters++;
+            input_npbst.bData.clear(); input_npbst.bShape.clear(); input_npbst.shape.clear();
+            g.buildRankVector(rank, input_npbst);
+            kernel->preloadGemv(&weight_npbst);
+            kernel->executeGemv(&weight_npbst, &input_npbst, false);
+            unsigned end_col = kernel->getResultColGemv(N / 16, N);
+            BurstType* raw = new BurstType[N];
+            kernel->readResult(raw, pimBankType::ODD_BANK, N, 0, 0, end_col);
+            kernel->runPIM();
+            vector<float> new_rank(N);
+            for (int v = 0; v < N; v++)
+                new_rank[v] = base + damping * convertH2F(raw[v].fp16ReduceSum());
+            delete[] raw;
+            float diff = 0.0f;
+            for (int v = 0; v < N; v++) diff += fabs(new_rank[v] - rank[v]);
+            rank = new_rank;
+            if (diff < tol) break;
+        }
+        return {rank, iters, kernel->getCycle()};
+    };
+
+    // Get initial converged ranks before any insertion
+    vector<float> uniform_init(N, 1.0f / N);
+    auto res_prev = runPIM(uniform_init);
+
+    mt19937 rng(55);
+    uniform_int_distribution<int> dist(0, N - 1);
+    int total_inserted = 0;
+
+    cout << "\n  edges_inserted,cold_iters,cold_cycles,warm_iters,warm_cycles,cycle_reduction_pct" << endl;
+
+    for (int batch : batch_sizes)
+    {
+        // Insert 'batch' more edges into the same graph
+        int inserted = 0;
+        for (int i = 0; i < batch * 4 && inserted < batch; i++)
+        {
+            int u = dist(rng), v = dist(rng);
+            if (u != v) { g.addEdge(u, v); inserted++; }
+        }
+        total_inserted += inserted;
+
+        // Cold restart (from uniform)
+        auto res_cold = runPIM(uniform_init);
+
+        // Warm restart (from previously converged ranks)
+        auto res_warm = runPIM(res_prev.rank);
+
+        double reduction = (res_cold.cycles > 0)
+            ? (1.0 - (double)res_warm.cycles / res_cold.cycles) * 100.0
+            : 0.0;
+
+        cout << "  " << total_inserted
+             << "," << res_cold.iters << "," << res_cold.cycles
+             << "," << res_warm.iters << "," << res_warm.cycles
+             << "," << fixed << setprecision(1) << reduction << endl;
+
+        // Warm result becomes the new baseline for next round
+        res_prev = res_warm;
+    }
+    cout << endl;
 }
 
 // ===========================================================================
