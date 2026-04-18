@@ -303,7 +303,7 @@ Here, the buffer must be at least 256bit size container.
 
 ---
 
-## 5. PageRank on PIM (Milestone 1)
+## 5. PageRank on PIM 
 
 This section covers the incremental PageRank implementation added for the EECS 573 final project.
 
@@ -344,22 +344,28 @@ scons
 # Run a specific test
 ./sim --gtest_filter="PageRankFixture.baseline_known_graph"
 ./sim --gtest_filter="PageRankFixture.stats_pim_vs_cpu"
+
+# Run only real-world graph tests (require dataset files in src/tests/)
+./sim --gtest_filter="PageRankFixture.real_world*"
 ```
 
-> Note: The PIM tests simulate cycle-accurate HBM2 memory, so they are slow on a laptop (each test takes 5–15 seconds of wall-clock time).
+> Note: The PIM tests simulate cycle-accurate HBM2 memory, so they are slow on a laptop (each synthetic test takes 5–15 seconds; real-world tests with N=512 can take 30–60 seconds).
 
 ### 5.5 Test descriptions
 
 | Test | What it does |
 |---|---|
 | `baseline_known_graph` | Runs CPU PageRank on a small 4-node graph. Checks ranks sum to 1 and are all positive. |
-| `baseline_incremental_edges` | Starts with a ring graph, inserts 10 edges, verifies warm-start converges to the same result as cold-start. |
-| `baseline_random_graph_timing` | Runs CPU PageRank on a random 256-node graph and reports wall-clock time. |
+| `baseline_incremental_edges` | Starts with a 64-node ring graph, inserts 10 random edges, verifies warm-start converges to the same result as cold-start. |
+| `baseline_random_graph_timing` | Runs CPU PageRank on a random 256-node graph (avg_deg=8) and reports wall-clock time. |
 | `pim_spmv_matches_cpu` | Runs one SpMV step on PIM and compares the result to the CPU. Passes if all 256 outputs are within 5% (FP16 tolerance). |
 | `pim_full_pagerank` | Runs full PageRank to convergence using PIM for each SpMV step. Compares final ranks to CPU baseline. |
-| `pim_incremental_edge_insertion` | Inserts 16 edges mid-run, then compares cold vs warm restart iteration counts on PIM. |
-| `stats_pim_vs_cpu` | Runs both versions and prints a side-by-side stats table (cycles, memory transactions, data moved, bandwidth). |
-| `stats_cpu_dram_simulated` | Routes the CPU's sparse memory access pattern through the same HBM2 DRAM simulator (no PIM ops), giving real simulated cycle counts for both sides so the comparison is apples-to-apples. |
+| `pim_incremental_edge_insertion` | Inserts 16 edges mid-run into a 256-node graph (avg_deg=6), then compares cold vs warm restart iteration counts on PIM. |
+| `stats_pim_vs_cpu` | Runs both versions and prints a side-by-side stats table (cycles, memory transactions, data moved, bandwidth). CPU traffic is estimated analytically (dense and sparse models). |
+| `stats_cpu_dram_simulated` | Routes the CPU's dense matrix memory access pattern through the same HBM2 DRAM simulator (no PIM ops), giving real simulated cycle counts for both sides so the comparison is apples-to-apples. |
+| `real_world_incremental_pagerank` | Loads the cit-HepPh citation graph, runs cold-start PIM PageRank on the first 85% of edges, then inserts the remaining 15% and runs a warm (delta) restart. Compares final ranks to CPU baseline. |
+| `real_world_web_google_pagerank` | Same two-stage cold/warm benchmark as above, using the web-Google web graph (875K nodes, 5.1M edges in the full dataset; capped at 512 nodes for simulation). |
+| `real_world_roadnet_pagerank` | Same two-stage cold/warm benchmark using the roadNet-CA road network graph; capped at 512 nodes for simulation. |
 
 ### 5.6 Understanding the output
 
@@ -437,14 +443,20 @@ Test 8 routes the CPU's sparse memory accesses through the same HBM2 DRAM simula
 
 ### 5.7 Graph parameters
 
-Tests use synthetic random graphs generated internally — no external files needed. Graph parameters are hardcoded per test:
+Synthetic tests generate graphs internally — no external files needed. Real-world tests require the dataset files to be present in `src/tests/`. Graph parameters are hardcoded per test:
 
-| Test | N (vertices) | Avg out-degree |
-|---|---|---|
-| baseline_known_graph | 4 | hand-crafted |
-| baseline_incremental_edges | 64 | 1 (ring) + 10 random |
-| baseline_random_graph_timing | 256 | 8 |
-| pim_* and stats_pim_vs_cpu | 256 | 8 |
-| stats_cpu_dram_simulated | 256 | 8 |
+| Test | N (vertices) | Avg out-degree | RNG seed | Source |
+|---|---|---|---|---|
+| `baseline_known_graph` | 4 | hand-crafted (5 edges) | — | synthetic |
+| `baseline_incremental_edges` | 64 | 1 (ring) + 10 random edges | 99 | synthetic |
+| `baseline_random_graph_timing` | 256 | 8 | 42 | synthetic |
+| `pim_spmv_matches_cpu` | 256 | 8 | 7 | synthetic |
+| `pim_full_pagerank` | 256 | 8 | 13 | synthetic |
+| `pim_incremental_edge_insertion` | 256 | 6 (+ 16 inserted) | 17 / 55 | synthetic |
+| `stats_pim_vs_cpu` | 256 | 8 | 42 | synthetic |
+| `stats_cpu_dram_simulated` | 256 | 8 | 42 | synthetic |
+| `real_world_incremental_pagerank` | ≤512 (padded to 16×) | real edges (85%/15% split) | — | `src/tests/cit-HepPh.txt` |
+| `real_world_web_google_pagerank` | ≤512 (padded to 16×) | real edges (85%/15% split) | — | `src/tests/web-Google.txt` |
+| `real_world_roadnet_pagerank` | ≤512 (padded to 16×) | real edges (85%/15% split) | — | `src/tests/roadNet-CA.txt` |
 
-To change graph size or density, edit the `const int N` and `avg_deg` values at the top of each test in `src/tests/PageRankTestCases.cpp`, then rebuild with `scons`.
+To change graph size or density for synthetic tests, edit the `const int N` and `avg_deg` values at the top of each test in [src/tests/PageRankTestCases.cpp](src/tests/PageRankTestCases.cpp), then rebuild with `scons`. For real-world tests, change `MAX_NODES` (must be a multiple of 16, or set `N % 16` padding applies automatically).
